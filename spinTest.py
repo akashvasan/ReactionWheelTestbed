@@ -3,8 +3,6 @@ Reaction Wheel Motor Controller (Pi 5 compatible)
 ===================================================
 Uses gpiozero + lgpio backend.
 
-Run first: sudo systemctl start pigpiod
-
 Wiring (from wire table):
   GPIO18 (Pin 12) -> RPWM          (forward PWM)    Wire T
   GPIO19 (Pin 35) -> LPWM          (reverse PWM)    Wire U
@@ -35,10 +33,14 @@ PWM_FREQ          = 1000   # Hz
 GEAR_RATIO        = 5.0    # 5:1 reduction
 MOTOR_MAX_RPM     = 6000   # REV HD Hex Motor free-speed RPM
 FLYWHEEL_MAX_RPM  = MOTOR_MAX_RPM / GEAR_RATIO   # 1200 RPM
-COUNTS_PER_REV    = 28 * GEAR_RATIO              # 140 counts per flywheel revolution (quadrature 4x = 560)
-RPM_SAMPLE_PERIOD = 0.1    # seconds between RPM calculations
+COUNTS_PER_REV    = 28 * 2 * GEAR_RATIO          # 280 counts per flywheel revolution (both edges on Ch A)
+RPM_SAMPLE_PERIOD = 0.1    # seconds between RPM/PID updates
 
-TARGET_RPM = 600  # <-- SET YOUR DESIRED FLYWHEEL RPM HERE (±1200 max, negative = reverse)
+# --- PD Gains (tune these) ---
+KP = 0.05   # proportional — keep low to avoid oscillation on inertial load
+KD = 0.01   # derivative — damps overshoot
+
+TARGET_RPM = -25  # <-- SET YOUR DESIRED FLYWHEEL RPM HERE (±1200 max, negative = reverse)
 
 
 class ReactionWheel:
@@ -51,24 +53,27 @@ class ReactionWheel:
 
         # Encoder state
         self._encoder_count = 0
-        self._last_count = 0
-        self._last_time = time.monotonic()
-        self._measured_rpm = 0.0
-        self._lock = threading.Lock()
+        self._last_count    = 0
+        self._last_time     = time.monotonic()
+        self._measured_rpm  = 0.0
+        self._lock          = threading.Lock()
+
+        # PD state
+        self._target_rpm  = 0.0
+        self._prev_error  = 0.0
+        self._duty        = 0.0
 
         # Set up encoder GPIO via lgpio directly
         self._gpio = lgpio.gpiochip_open(0)
-        lgpio.gpio_claim_input(self._gpio, ENC_A_PIN)
-        lgpio.gpio_claim_input(self._gpio, ENC_B_PIN)
-        lgpio.gpio_claim_alert(self._gpio, ENC_A_PIN, lgpio.BOTH_EDGES)
-        lgpio.callback(self._gpio, ENC_A_PIN, lgpio.BOTH_EDGES, self._encoder_callback)
+        lgpio.gpio_claim_alert(self._gpio, ENC_A_PIN, lgpio.BOTH_EDGES, lgpio.SET_PULL_UP)
+        lgpio.gpio_claim_input(self._gpio, ENC_B_PIN, lgpio.SET_PULL_UP)
+        self._enc_cb = lgpio.callback(self._gpio, ENC_A_PIN, lgpio.BOTH_EDGES, self._encoder_callback)
 
-        # Background thread to compute RPM
+        # Background thread: measure RPM + run PID
         self._running = True
         self._rpm_thread = threading.Thread(target=self._rpm_loop, daemon=True)
         self._rpm_thread.start()
 
-        self._speed = 0
         print(f"Reaction wheel ready. Max flywheel speed: {FLYWHEEL_MAX_RPM:.0f} RPM")
 
     # ------------------------------------------------------------------
@@ -83,7 +88,7 @@ class ReactionWheel:
                 self._encoder_count += 1 if b == 1 else -1
 
     # ------------------------------------------------------------------
-    # Background thread — recalculates RPM every RPM_SAMPLE_PERIOD
+    # Background thread — measures RPM and updates PID every sample period
     # ------------------------------------------------------------------
     def _rpm_loop(self):
         while self._running:
@@ -94,15 +99,24 @@ class ReactionWheel:
                 self._last_count = self._encoder_count
             delta_time = now - self._last_time
             self._last_time = now
-            # counts / counts_per_rev / time_in_min = RPM
+
             self._measured_rpm = (delta_counts / COUNTS_PER_REV) / (delta_time / 60.0)
 
+            # PD with feedforward
+            error = self._target_rpm - self._measured_rpm
+            derivative = (error - self._prev_error) / delta_time
+            self._prev_error = error
+
+            feedforward = (self._target_rpm / FLYWHEEL_MAX_RPM) * 100.0
+            duty = feedforward + KP * error + KD * derivative
+            self._set_speed(duty)
+
     # ------------------------------------------------------------------
-    # Core speed setter (motor duty cycle, -100 to +100)
+    # Core speed setter — duty cycle -100 to +100
     # ------------------------------------------------------------------
-    def set_speed(self, speed: float):
+    def _set_speed(self, speed: float):
         speed = max(-100.0, min(100.0, speed))
-        self._speed = speed
+        self._duty = speed
         duty = abs(speed) / 100.0
 
         if speed > 0:
@@ -115,45 +129,17 @@ class ReactionWheel:
             self.rpwm.value = 0
             self.lpwm.value = 0
 
-    def set_flywheel_rpm(self, rpm: float):
-        rpm = max(-FLYWHEEL_MAX_RPM, min(FLYWHEEL_MAX_RPM, rpm))
-        self.set_speed((rpm / FLYWHEEL_MAX_RPM) * 100.0)
-
-    def ramp_to_rpm(self, target_rpm: float, ramp_duration: float = 1.5):
-        """Smoothly ramp to a target RPM."""
-        start_rpm = self.commanded_rpm
-        steps = 50
-        delay = ramp_duration / steps
-        for i in range(steps + 1):
-            interp = start_rpm + (target_rpm - start_rpm) * (i / steps)
-            self.set_flywheel_rpm(interp)
-            time.sleep(delay)
-
-    def run(self, target_rpm: float, ramp_duration: float = 1.5):
-        """
-        Ramp to target_rpm and hold, printing live status.
-        Press Ctrl+C to stop.
-        """
-        print(f"\nTarget: {target_rpm:.0f} RPM  (max: ±{FLYWHEEL_MAX_RPM:.0f} RPM)")
-        print("-" * 55)
-
-        self.ramp_to_rpm(target_rpm, ramp_duration)
-
-        print("\nHolding speed — press Ctrl+C to stop\n")
-        try:
-            while True:
-                self._print_status()
-                time.sleep(0.2)
-        except KeyboardInterrupt:
-            print("\n\nStopping...")
-            self.ramp_to_rpm(0, ramp_duration=1.0)
+    def set_target_rpm(self, rpm: float):
+        self._target_rpm = max(-FLYWHEEL_MAX_RPM, min(FLYWHEEL_MAX_RPM, rpm))
+        self._prev_error = 0.0
 
     def stop(self):
-        self.set_speed(0)
+        self.set_target_rpm(0)
 
     def cleanup(self):
         self._running = False
-        self.stop()
+        self._set_speed(0)
+        self._enc_cb.cancel()
         self.rpwm.close()
         self.lpwm.close()
         self.r_en.close()
@@ -162,36 +148,38 @@ class ReactionWheel:
         print("\nGPIO cleaned up.")
 
     # ------------------------------------------------------------------
-    # Properties
+    # Run: set target and hold, printing live status
     # ------------------------------------------------------------------
-    @property
-    def commanded_rpm(self) -> float:
-        """RPM calculated from duty cycle (what we asked for)."""
-        return (self._speed / 100.0) * FLYWHEEL_MAX_RPM
-
-    @property
-    def measured_rpm(self) -> float:
-        """Actual RPM measured from encoder."""
-        return self._measured_rpm
-
-    @property
-    def speed_percent(self) -> float:
-        return abs(self._speed)
+    def run(self, target_rpm: float):
+        print(f"\nTarget: {target_rpm:.0f} RPM  (max: ±{FLYWHEEL_MAX_RPM:.0f} RPM)")
+        print(f"PD gains — Kp={KP}  Kd={KD}")
+        print("-" * 60)
+        self.set_target_rpm(target_rpm)
+        print("Press Ctrl+C to stop\n")
+        try:
+            while True:
+                self._print_status()
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            print("\n\nStopping...")
+            self.stop()
+            time.sleep(2.0)
 
     # ------------------------------------------------------------------
     # Terminal output
     # ------------------------------------------------------------------
     def _print_status(self):
-        cmd_rpm = self.commanded_rpm
-        meas_rpm = self.measured_rpm
-        pct = self.speed_percent
-        direction = "FWD" if cmd_rpm >= 0 else "REV"
-        bar_len = int(pct / 2)
-        bar = "█" * bar_len + "░" * (50 - bar_len)
+        target    = self._target_rpm
+        measured  = self._measured_rpm
+        pct       = abs(self._duty)
+        direction = "FWD" if target >= 0 else "REV"
+        with self._lock:
+            enc = self._encoder_count
         print(
-            f"\r{direction} |{bar}| {pct:5.1f}%  "
-            f"CMD: {abs(cmd_rpm):6.1f} RPM  "
-            f"ACTUAL: {abs(meas_rpm):6.1f} RPM",
+            f"\r{direction}  duty={pct:5.1f}%  "
+            f"TARGET: {target:7.1f} RPM  "
+            f"ACTUAL: {measured:7.1f} RPM  "
+            f"enc={enc}",
             end="", flush=True
         )
 
