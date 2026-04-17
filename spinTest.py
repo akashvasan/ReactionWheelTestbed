@@ -1,25 +1,22 @@
 """
 Reaction Wheel Motor Controller (Pi 5 compatible)
 ===================================================
-Uses gpiozero + pigpio backend instead of RPi.GPIO,
-which does not support the Raspberry Pi 5.
+Uses gpiozero + lgpio backend.
 
-Run first: sudo pigpiod
+Run first: sudo pigpiod  (or lgpiod if using lgpio)
 
 Wiring (from wire table):
   GPIO18 (Pin 12) -> RPWM   (forward PWM)   Wire T
   GPIO19 (Pin 35) -> LPWM   (reverse PWM)   Wire U
   GPIO23 (Pin 16) -> R_EN   (right enable)  Wire V
   GPIO24 (Pin 18) -> L_EN   (left enable)   Wire W
-
-Speed: -100 to +100 (negative = reverse, 0 = stop)
 """
 
 import time
 from gpiozero import PWMOutputDevice, OutputDevice
-from gpiozero.pins.pigpio import PiGPIOFactory
+from gpiozero.pins.lgpio import LGPIOFactory
 
-factory = PiGPIOFactory()  # uses pigpio backend
+factory = LGPIOFactory()
 
 # --- Pin Definitions (BCM numbering) ---
 RPWM_PIN = 18
@@ -27,7 +24,10 @@ LPWM_PIN = 19
 R_EN_PIN = 23
 L_EN_PIN = 24
 
-PWM_FREQ = 1000  # Hz
+PWM_FREQ       = 1000   # Hz
+GEAR_RATIO     = 5.0    # 5:1 reduction
+MOTOR_MAX_RPM  = 6000   # REV HD Hex Motor free-speed RPM
+FLYWHEEL_MAX_RPM = MOTOR_MAX_RPM / GEAR_RATIO  # 1200 RPM
 
 
 class ReactionWheel:
@@ -37,20 +37,16 @@ class ReactionWheel:
         self.r_en = OutputDevice(R_EN_PIN, initial_value=True, pin_factory=factory)
         self.l_en = OutputDevice(L_EN_PIN, initial_value=True, pin_factory=factory)
 
-        self._speed = 0
-        print("Reaction wheel initialized.")
+        self._speed = 0  # motor duty cycle, -100 to +100
+        print(f"Reaction wheel ready. Max flywheel speed: {FLYWHEEL_MAX_RPM:.0f} RPM")
 
+    # ------------------------------------------------------------------
+    # Core speed setter (motor duty cycle, -100 to +100)
+    # ------------------------------------------------------------------
     def set_speed(self, speed: float):
-        """
-        Set motor speed.
-        speed: -100.0 to +100.0
-          positive -> forward (RPWM)
-          negative -> reverse (LPWM)
-          0        -> stop
-        """
-        speed = max(-100.0, min(100.0, speed))  # clamp
+        speed = max(-100.0, min(100.0, speed))
         self._speed = speed
-        duty = abs(speed) / 100.0  # gpiozero uses 0.0 - 1.0
+        duty = abs(speed) / 100.0
 
         if speed > 0:
             self.rpwm.value = duty
@@ -62,24 +58,61 @@ class ReactionWheel:
             self.rpwm.value = 0
             self.lpwm.value = 0
 
-    def stop(self):
-        """Stop the motor immediately."""
-        self.set_speed(0)
-        print("Motor stopped.")
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def set_flywheel_rpm(self, rpm: float):
+        """
+        Set desired flywheel RPM directly.
+        Positive = forward, negative = reverse.
+        Clamped to ±FLYWHEEL_MAX_RPM.
+        """
+        rpm = max(-FLYWHEEL_MAX_RPM, min(FLYWHEEL_MAX_RPM, rpm))
+        motor_speed_pct = (rpm / FLYWHEEL_MAX_RPM) * 100.0
+        self.set_speed(motor_speed_pct)
 
-    def ramp_to(self, target_speed: float, duration: float = 1.0, steps: int = 50):
+    def run(self, target_rpm: float, ramp_duration: float = 1.5):
         """
-        Smoothly ramp from current speed to target over `duration` seconds.
+        Ramp to target_rpm and hold, printing live status to terminal.
+        Press Ctrl+C to stop.
         """
-        start_speed = self._speed
-        delay = duration / steps
+        print(f"\nTarget: {target_rpm:.0f} RPM  (max: ±{FLYWHEEL_MAX_RPM:.0f} RPM)")
+        print("-" * 40)
+
+        # Ramp up smoothly
+        start_rpm = self.flywheel_rpm
+        steps = 50
+        delay = ramp_duration / steps
         for i in range(steps + 1):
-            interp = start_speed + (target_speed - start_speed) * (i / steps)
-            self.set_speed(interp)
+            interp = start_rpm + (target_rpm - start_rpm) * (i / steps)
+            self.set_flywheel_rpm(interp)
+            self._print_status()
             time.sleep(delay)
 
+        # Hold and keep printing
+        print("\nHolding speed — press Ctrl+C to stop\n")
+        try:
+            while True:
+                self._print_status()
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n\nStopping...")
+            self.ramp_to_rpm(0, ramp_duration=1.0)
+
+    def ramp_to_rpm(self, target_rpm: float, ramp_duration: float = 1.5):
+        """Smoothly ramp to a target RPM without holding."""
+        start_rpm = self.flywheel_rpm
+        steps = 50
+        delay = ramp_duration / steps
+        for i in range(steps + 1):
+            interp = start_rpm + (target_rpm - start_rpm) * (i / steps)
+            self.set_flywheel_rpm(interp)
+            time.sleep(delay)
+
+    def stop(self):
+        self.set_speed(0)
+
     def cleanup(self):
-        """Release GPIO resources."""
         self.stop()
         self.rpwm.close()
         self.lpwm.close()
@@ -87,37 +120,38 @@ class ReactionWheel:
         self.l_en.close()
         print("GPIO cleaned up.")
 
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
     @property
-    def speed(self):
-        return self._speed
+    def flywheel_rpm(self) -> float:
+        return (self._speed / 100.0) * FLYWHEEL_MAX_RPM
+
+    @property
+    def speed_percent(self) -> float:
+        return abs(self._speed)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+    def _print_status(self):
+        rpm = self.flywheel_rpm
+        pct = self.speed_percent
+        direction = "FWD" if rpm >= 0 else "REV"
+        bar_len = int(pct / 2)  # 50 chars = 100%
+        bar = "█" * bar_len + "░" * (50 - bar_len)
+        print(f"\r{direction} |{bar}| {pct:5.1f}%  {abs(rpm):6.1f} RPM", end="", flush=True)
 
 
-# --- Simple demo ---
+# --- Entry point ---
 if __name__ == "__main__":
     wheel = ReactionWheel()
 
+    TARGET_RPM = 600  # <-- set your desired flywheel RPM here (±1200 max, negative=reverse)
+
     try:
-        print("Ramping to 50% forward...")
-        wheel.ramp_to(50, duration=1.5)
-        time.sleep(2)
-
-        print("Ramping to full speed...")
-        wheel.ramp_to(100, duration=1.0)
-        time.sleep(2)
-
-        print("Ramping to stop...")
-        wheel.ramp_to(0, duration=1.5)
-        time.sleep(1)
-
-        print("Ramping to 60% reverse...")
-        wheel.ramp_to(-60, duration=1.5)
-        time.sleep(2)
-
-        print("Ramping to stop...")
-        wheel.ramp_to(0, duration=1.5)
-
+        wheel.run(TARGET_RPM)
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-
+        print("\nAborted.")
     finally:
         wheel.cleanup()
