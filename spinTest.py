@@ -1,47 +1,41 @@
 """
-Reaction Wheel Motor Controller
-================================
-Hardware: Raspberry Pi 5 -> H-Bridge Motor Driver -> REV HD Hex Motor
+Reaction Wheel Motor Controller (Pi 5 compatible)
+===================================================
+Uses gpiozero + pigpio backend instead of RPi.GPIO,
+which does not support the Raspberry Pi 5.
+
+Run first: sudo pigpiod
 
 Wiring (from wire table):
-  GPIO18 (Pin 12) -> RPWM   (right/forward PWM)
-  GPIO19 (Pin 35) -> LPWM   (left/reverse PWM)
-  GPIO23 (Pin 16) -> R_EN   (right enable)
-  GPIO24 (Pin 18) -> L_EN   (left enable)
+  GPIO18 (Pin 12) -> RPWM   (forward PWM)   Wire T
+  GPIO19 (Pin 35) -> LPWM   (reverse PWM)   Wire U
+  GPIO23 (Pin 16) -> R_EN   (right enable)  Wire V
+  GPIO24 (Pin 18) -> L_EN   (left enable)   Wire W
 
 Speed: -100 to +100 (negative = reverse, 0 = stop)
 """
 
-import RPi.GPIO as GPIO
 import time
+from gpiozero import PWMOutputDevice, OutputDevice
+from gpiozero.pins.pigpio import PiGPIOFactory
+
+factory = PiGPIOFactory()  # uses pigpio backend
 
 # --- Pin Definitions (BCM numbering) ---
-RPWM_PIN = 18   # Forward PWM  (Wire T)
-LPWM_PIN = 19   # Reverse PWM  (Wire U)
-R_EN_PIN = 23   # Right enable (Wire V)
-L_EN_PIN = 24   # Left enable  (Wire W)
+RPWM_PIN = 18
+LPWM_PIN = 19
+R_EN_PIN = 23
+L_EN_PIN = 24
 
-PWM_FREQ = 1000  # Hz — 1kHz is safe for most H-bridges
+PWM_FREQ = 1000  # Hz
 
 
 class ReactionWheel:
     def __init__(self):
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-
-        # Set all pins as outputs
-        for pin in (RPWM_PIN, LPWM_PIN, R_EN_PIN, L_EN_PIN):
-            GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
-
-        # Enable both H-bridge channels
-        GPIO.output(R_EN_PIN, GPIO.HIGH)
-        GPIO.output(L_EN_PIN, GPIO.HIGH)
-
-        # Set up PWM on both direction pins
-        self.rpwm = GPIO.PWM(RPWM_PIN, PWM_FREQ)
-        self.lpwm = GPIO.PWM(LPWM_PIN, PWM_FREQ)
-        self.rpwm.start(0)
-        self.lpwm.start(0)
+        self.rpwm = PWMOutputDevice(RPWM_PIN, frequency=PWM_FREQ, pin_factory=factory)
+        self.lpwm = PWMOutputDevice(LPWM_PIN, frequency=PWM_FREQ, pin_factory=factory)
+        self.r_en = OutputDevice(R_EN_PIN, initial_value=True, pin_factory=factory)
+        self.l_en = OutputDevice(L_EN_PIN, initial_value=True, pin_factory=factory)
 
         self._speed = 0
         print("Reaction wheel initialized.")
@@ -56,16 +50,17 @@ class ReactionWheel:
         """
         speed = max(-100.0, min(100.0, speed))  # clamp
         self._speed = speed
+        duty = abs(speed) / 100.0  # gpiozero uses 0.0 - 1.0
 
         if speed > 0:
-            self.rpwm.ChangeDutyCycle(speed)
-            self.lpwm.ChangeDutyCycle(0)
+            self.rpwm.value = duty
+            self.lpwm.value = 0
         elif speed < 0:
-            self.rpwm.ChangeDutyCycle(0)
-            self.lpwm.ChangeDutyCycle(-speed)
+            self.rpwm.value = 0
+            self.lpwm.value = duty
         else:
-            self.rpwm.ChangeDutyCycle(0)
-            self.lpwm.ChangeDutyCycle(0)
+            self.rpwm.value = 0
+            self.lpwm.value = 0
 
     def stop(self):
         """Stop the motor immediately."""
@@ -74,8 +69,7 @@ class ReactionWheel:
 
     def ramp_to(self, target_speed: float, duration: float = 1.0, steps: int = 50):
         """
-        Smoothly ramp from current speed to target_speed over `duration` seconds.
-        Avoids mechanical shock on the reaction wheel bearing.
+        Smoothly ramp from current speed to target over `duration` seconds.
         """
         start_speed = self._speed
         delay = duration / steps
@@ -87,9 +81,10 @@ class ReactionWheel:
     def cleanup(self):
         """Release GPIO resources."""
         self.stop()
-        self.rpwm.stop()
-        self.lpwm.stop()
-        GPIO.cleanup()
+        self.rpwm.close()
+        self.lpwm.close()
+        self.r_en.close()
+        self.l_en.close()
         print("GPIO cleaned up.")
 
     @property
@@ -97,7 +92,7 @@ class ReactionWheel:
         return self._speed
 
 
-# --- Simple demo / manual control ---
+# --- Simple demo ---
 if __name__ == "__main__":
     wheel = ReactionWheel()
 
