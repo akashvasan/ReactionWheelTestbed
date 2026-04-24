@@ -10,7 +10,7 @@ import lgpio, time, threading
 #   GPIO17 (Pin 11) -> Encoder Ch A               Wire X
 #   GPIO27 (Pin 13) -> Encoder Ch B               Wire Y
 
-DUTY_CYCLE      = 0.8    # 0.0 to 1.0
+DUTY_CYCLE      = 0.1    # 0.0 to 1.0
 COUNTS_PER_REV  = 28 * 2 * 5.0   # both edges on Ch A * gear ratio = 280
 SAMPLE_PERIOD   = 0.2             # seconds between RPM prints
 

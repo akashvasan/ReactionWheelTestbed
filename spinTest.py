@@ -45,11 +45,11 @@ TARGET_RPM = -25  # <-- SET YOUR DESIRED FLYWHEEL RPM HERE (±1200 max, negative
 
 class ReactionWheel:
     def __init__(self):
-        # Motor outputs
-        self.rpwm = PWMOutputDevice(RPWM_PIN, frequency=PWM_FREQ, pin_factory=factory)
-        self.lpwm = PWMOutputDevice(LPWM_PIN, frequency=PWM_FREQ, pin_factory=factory)
-        self.r_en = OutputDevice(R_EN_PIN, initial_value=True, pin_factory=factory)
-        self.l_en = OutputDevice(L_EN_PIN, initial_value=True, pin_factory=factory)
+        # Motor outputs — direction pins on RPWM/LPWM, speed PWM on R_EN/L_EN
+        self.rpwm = OutputDevice(RPWM_PIN, initial_value=True,  pin_factory=factory)
+        self.lpwm = OutputDevice(LPWM_PIN, initial_value=False, pin_factory=factory)
+        self.r_en = PWMOutputDevice(R_EN_PIN, frequency=PWM_FREQ, pin_factory=factory)
+        self.l_en = PWMOutputDevice(L_EN_PIN, frequency=PWM_FREQ, pin_factory=factory)
 
         # Encoder state
         self._encoder_count = 0
@@ -120,14 +120,16 @@ class ReactionWheel:
         duty = abs(speed) / 100.0
 
         if speed > 0:
-            self.rpwm.value = duty
-            self.lpwm.value = 0
+            self.rpwm.on()
+            self.lpwm.off()
         elif speed < 0:
-            self.rpwm.value = 0
-            self.lpwm.value = duty
+            self.rpwm.off()
+            self.lpwm.on()
         else:
-            self.rpwm.value = 0
-            self.lpwm.value = 0
+            self.rpwm.off()
+            self.lpwm.off()
+        self.r_en.value = duty
+        self.l_en.value = duty
 
     def set_target_rpm(self, rpm: float):
         self._target_rpm = max(-FLYWHEEL_MAX_RPM, min(FLYWHEEL_MAX_RPM, rpm))
