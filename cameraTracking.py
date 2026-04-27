@@ -104,9 +104,10 @@ def main():
     log_file = open(log_path, "w", newline="")
     logger   = csv.writer(log_file)
     logger.writerow(["t_s", "centroid_x", "error", "duty", "state"])
-    t0         = time.monotonic()
-    prev_error = 0.0
-    prev_time  = time.monotonic()
+    t0            = time.monotonic()
+    prev_error    = 0.0
+    prev_time     = time.monotonic()
+    was_searching = True
 
     try:
         while True:
@@ -132,15 +133,19 @@ def main():
             prev_time = now
 
             if centroid_x is None:
-                duty       = SEARCH_DUTY
+                duty          = SEARCH_DUTY
                 set_duty(duty)
-                state      = " SEARCH"
-                error      = 0.0
-                prev_error = 0.0
+                state         = " SEARCH"
+                error         = 0.0
+                prev_error    = 0.0
+                was_searching = True
             else:
                 error      = (centroid_x - CX) / CX   # -1.0 to +1.0
-                derivative = (error - prev_error) / dt if dt > 0 else 0.0
-                prev_error = error
+                # Zero the derivative on the first frame after acquiring target
+                # to avoid a spike from prev_error being held at 0 during search
+                derivative    = 0.0 if was_searching else (error - prev_error) / dt if dt > 0 else 0.0
+                prev_error    = error
+                was_searching = False
                 if abs(error) < DEADBAND:
                     stop_motor()
                     state = "CENTERED"
