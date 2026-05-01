@@ -36,11 +36,14 @@ from adafruit_bno08x import BNO_REPORT_GYROSCOPE
 # ---------------------------------------------------------------------------
 # Tunable constants
 # ---------------------------------------------------------------------------
-KP            = 1    # proportional gain
-KD            = 0.0    # derivative disabled — KD causes sign flip during fast deceleration
+KP            = 1      # proportional gain
+KI            = 0.75   # integral gain
+KD            = 0.05   # derivative gain
+INTEGRAL_MAX  = 1.0    # anti-windup clamp on raw integral accumulator
 K_WHEEL_BRAKE = 0.05   # wheel momentum damping gain (used when platform is near zero)
 DEADBAND_RPM  = 0.3    # ignore error smaller than this to avoid fighting IMU noise
 SAMPLE_PERIOD = 0.05   # seconds between control updates (20 Hz)
+LPF_ALPHA     = 0.2    # IMU low-pass EMA coefficient (smaller = more smoothing)
 MAX_DUTY      = 50.0   # hard cap on motor duty cycle (%)
 SAFETY_RPM    = 150.0  # emergency stop if testbed platform exceeds this speed
 MOTOR_SAFETY_RPM = 120.0  # emergency stop if reaction wheel motor exceeds this speed
@@ -102,11 +105,11 @@ def set_duty(duty_pct: float):
         lgpio.gpio_write(_gpio, RPWM_PIN, 1)
         lgpio.gpio_write(_gpio, LPWM_PIN, 0)
         lgpio.tx_pwm(_gpio, R_EN_PIN, PWM_FREQ, pwm)
-        lgpio.gpio_write(_gpio, L_EN_PIN, 1)
+        lgpio.tx_pwm(_gpio, L_EN_PIN, PWM_FREQ, 100)
     elif duty_pct < 0:
         lgpio.gpio_write(_gpio, RPWM_PIN, 0)
         lgpio.gpio_write(_gpio, LPWM_PIN, 1)
-        lgpio.gpio_write(_gpio, R_EN_PIN, 1)
+        lgpio.tx_pwm(_gpio, R_EN_PIN, PWM_FREQ, 100)
         lgpio.tx_pwm(_gpio, L_EN_PIN, PWM_FREQ, pwm)
     else:
         lgpio.gpio_write(_gpio, RPWM_PIN, 0)
@@ -141,13 +144,15 @@ def main():
     print("-" * 55)
 
     prev_error = 0.0
+    integral   = 0.0
+    lpf_rpm    = 0.0
     prev_time  = time.monotonic()
     last_count = 0
     t0         = time.monotonic()
 
     log_file = open(log_path, "w", newline="")
     logger   = csv.writer(log_file)
-    logger.writerow(["t_s", "gx", "gz", "imu_rpm", "wheel_rpm", "error", "duty", "state"])
+    logger.writerow(["t_s", "gx", "gz", "imu_rpm", "wheel_rpm", "error", "duty", "state", "p_term", "i_term", "d_term"])
 
     try:
         while True:
@@ -156,7 +161,9 @@ def main():
             dt  = now - prev_time
             prev_time = now
 
-            measured_rpm, gx, gz = platform_rpm_from_imu()
+            raw_rpm, gx, gz = platform_rpm_from_imu()
+            lpf_rpm         = LPF_ALPHA * raw_rpm + (1.0 - LPF_ALPHA) * lpf_rpm
+            measured_rpm    = lpf_rpm
 
             with enc_lock:
                 count = enc_count
@@ -178,19 +185,26 @@ def main():
             prev_error = error
 
             if abs(error) < DEADBAND_RPM:
-                # Platform near zero — brake the wheel to bleed off stored momentum
-                duty  = -K_WHEEL_BRAKE * wheel_rpm
-                state = "  HOLD"
+                # Platform near zero — reset integral and brake the wheel
+                integral = 0.0
+                duty     = -K_WHEEL_BRAKE * wheel_rpm
+                state    = "  HOLD"
+                p_term, i_term, d_term = 0.0, 0.0, 0.0
             else:
-                duty  = -(KP * error + KD * derivative)
-                state = "ACTIVE"
+                integral = max(-INTEGRAL_MAX, min(INTEGRAL_MAX, integral + error * dt))
+                p_term   = KP * error
+                i_term   = KI * integral
+                d_term   = KD * derivative
+                duty     = p_term + i_term + d_term
+                state    = "ACTIVE"
 
             set_duty(duty)
 
             logger.writerow([
                 f"{now - t0:.3f}", f"{gx:.4f}", f"{gz:.4f}",
                 f"{measured_rpm:.3f}", f"{wheel_rpm:.3f}",
-                f"{error:.3f}", f"{duty:.3f}", state.strip()
+                f"{error:.3f}", f"{duty:.3f}", state.strip(),
+                f"{p_term:.3f}", f"{i_term:.3f}", f"{d_term:.3f}"
             ])
             print(
                 f"\r{measured_rpm:>10.2f}  {wheel_rpm:>10.1f}  {error:>8.2f}  {duty:>8.1f}  {state:>8}",

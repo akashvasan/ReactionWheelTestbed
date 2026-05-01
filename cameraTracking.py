@@ -23,15 +23,17 @@ from picamera2 import Picamera2
 # Tunable constants
 # ---------------------------------------------------------------------------
 KP            = 20.0   # proportional gain (scales [-1,1] error to duty %)
-KD            = 1.0    # derivative gain (dampens oscillation)
+KI            = 1.0    # integral gain
+KD            = 1      # derivative gain (dampens oscillation)
 MAX_DUTY      = 50.0   # hard cap on motor duty (%)
+INTEGRAL_MAX  = 20.0   # anti-windup clamp on raw integral accumulator
 DEADBAND      = 0.03   # ignore error smaller than this fraction of half-width
 SAMPLE_PERIOD = 0.05   # seconds between control updates (20 Hz)
-SEARCH_DUTY   = 15.0   # duty cycle (%) while scanning for target
+SEARCH_DUTY   = 10.0   # duty cycle (%) while scanning for target
 
-# Bright yellow HSV range (OpenCV: H 0-180, S 0-255, V 0-255)
-HSV_LOWER = np.array([ 20, 180, 180])
-HSV_UPPER = np.array([ 35, 255, 255])
+# Hot pink / magenta HSV range (OpenCV: H 0-180, S 0-255, V 0-255)
+HSV_LOWER = np.array([140, 150, 150])
+HSV_UPPER = np.array([170, 255, 255])
 
 MIN_BLOB_AREA = 500    # pixels — ignore tiny detections
 
@@ -79,10 +81,21 @@ def stop_motor():
     lgpio.tx_pwm(_gpio, L_EN_PIN, PWM_FREQ, 0)
 
 # ---------------------------------------------------------------------------
+# Camera settings
+# ---------------------------------------------------------------------------
+EXPOSURE_US   = 2000   # shutter speed in microseconds (2 ms) — reduce for less blur
+ANALOGUE_GAIN = 4.0    # ISO-like gain to compensate for fast shutter
+
+# ---------------------------------------------------------------------------
 # Camera init
 # ---------------------------------------------------------------------------
 picam2 = Picamera2()
 picam2.configure(picam2.create_preview_configuration(main={"size": (640, 480)}))
+picam2.set_controls({
+    "AeEnable":     False,
+    "ExposureTime": EXPOSURE_US,
+    "AnalogueGain": ANALOGUE_GAIN,
+})
 picam2.start()
 time.sleep(2)
 print("Camera ready.")
@@ -97,7 +110,7 @@ def main():
     log_path = "/home/fri/Desktop/ReactionWheelTestbed/tracking_log.csv"
     print(f"Camera tracking started. KP={KP}  MAX_DUTY={MAX_DUTY}%  Deadband={DEADBAND}")
     print(f"Logging to {log_path}")
-    print("Hold the lime-green target in view. Press Ctrl+C to stop.\n")
+    print("Hold the hot-pink target in view. Press Ctrl+C to stop.\n")
     print(f"{'centroid_x':>12}  {'error':>8}  {'duty %':>8}  {'state':>10}")
     print("-" * 50)
 
@@ -106,6 +119,7 @@ def main():
     logger.writerow(["t_s", "centroid_x", "error", "duty", "state"])
     t0            = time.monotonic()
     prev_error    = 0.0
+    integral      = 0.0
     prev_time     = time.monotonic()
     was_searching = True
 
@@ -138,12 +152,14 @@ def main():
                 state         = " SEARCH"
                 error         = 0.0
                 prev_error    = 0.0
+                integral      = 0.0
                 was_searching = True
             else:
                 error      = (centroid_x - CX) / CX   # -1.0 to +1.0
                 # Zero the derivative on the first frame after acquiring target
                 # to avoid a spike from prev_error being held at 0 during search
                 derivative    = 0.0 if was_searching else (error - prev_error) / dt if dt > 0 else 0.0
+                integral      = max(-INTEGRAL_MAX, min(INTEGRAL_MAX, integral + error * dt))
                 prev_error    = error
                 was_searching = False
                 if abs(error) < DEADBAND:
@@ -151,7 +167,7 @@ def main():
                     state = "CENTERED"
                     duty  = 0.0
                 else:
-                    duty = KP * error + KD * derivative
+                    duty = KP * error + KI * integral + KD * derivative
                     set_duty(duty)
                     state = "TRACKING"
 
